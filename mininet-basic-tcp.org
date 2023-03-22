@@ -1,0 +1,296 @@
+#+title:  How to set up mininet and tc for a simple TCP test
+#+author: Michael Welzl and Kristjon Ciko
+#+date:   2023-03-22
+
+This explains how to create a very simple testbed consisting of three nodes,
+with limited bandwidth and some delay, and do a very simple TCP test with it.
+The goal is to see TCP’s congestion control “in action”: see the correct
+behavior of the congestion window.
+
+* Setting up the nodes with mininet
+
+Create three nodes: a sender host H1, a receiver host H2, and a router R,
+connected as follows: H1 — R — H2
+
+#+begin_src python
+
+  """ Simple mininet script to create the following topology
+      H1 ---- R ---- H2
+      Usage: sudo -E mn --custom topo.py --topo mytopo
+  """
+
+  from mininet.topo import Topo
+  from mininet.link import Link, TCLink
+  from mininet.node import Node
+
+  class LinuxRouter( Node ):
+       def config( self, **params ):
+           super( LinuxRouter, self).config( **params )
+           self.cmd( 'sysctl net.ipv4.ip_forward=1' )
+
+       def terminate( self ):
+            self.cmd( 'sysctl net.ipv4.ip_forward=0' )
+            super( LinuxRouter, self ).terminate()
+
+  class MyTopo( Topo ):
+       "Simple topology example."
+
+       def __init__( self ):
+           "Create custom topology."
+
+           # Initialize topology
+           Topo.__init__( self )
+
+           # Add hosts and router
+           h1 = self.addHost('h1', ip='10.1.1.100/24', defaultRoute='via 10.1.1.1')
+           r = self.addHost('r', ip='10.1.1.1/24', cls=LinuxRouter)
+           h2 = self.addHost('h2', ip='10.2.2.100/24', defaultRoute='via 10.2.2.1')
+
+           # Add links
+           self.addLink(h1, r, intfName1='h1-r', intfName2='r-h1', cls=TCLink)
+           self.addLink(h2, r, intfName1='h2-r', intfName2='r-h2',
+                    params2={'ip': '10.2.2.1/24'}, cls=TCLink)
+
+           topos = { 'mytopo': ( lambda: MyTopo() ) }
+#+end_src
+
+* Configuring bandwidth, delay and queue with tc
+
+Do not test without limiting the capacity or configuring some delay. Remember,
+TCP’s congestion control operation depends on the Bandwidth*Delay Product (BDP).
+“Delay” here really means the round-trip time (RTT). You need to configure the
+limitation on the outgoing (egress) interface of R. mininet offers to perform
+this limitation, and it uses tc below; however, this gives you less control over
+what really happens. mininet configures the limitation in both directions (we
+want it only in the direction of traffic, not the direction of the ACKs);
+mininet also configures a queue limit in packets, which can lead to unexpected
+behavior when dealing with a mix of small and large packets.
+
+We want a BDP that is not 1 byte (because that would be a strange corner case)
+and is not 1000000000 bytes (because we might run out of buffer or get various
+kinds of other problems). Indeed, we want a “handful” of packets. Note: TCP’s
+cwnd is in bytes, and without window scaling, flow control will limit the send
+rate to what can be written in the rwnd field in the header, which is 16 bit
+long. This means that the maximum rate of TCP, then, becomes 65536 bytes / RTT,
+which can be a quite small value. Now, it is not uncommon for systems to do
+window scaling (i.e., agree to left-shift the value in this field) by default,
+but only with a small value (maybe 2 or 3), because TCP otherwise needs to
+reserve a huge amount of buffer space. So, also the buffer space can become a
+limit.
+
+Another thing to consider: if your RTT is 0.01 ms, and timing fluctuations of
+your CPU are about the same, then TCP can get into trouble because its measured
+RTT fluctuates a lot. Hence, you want a reasonably large RTT. Please keep these
+things in mind when configuring the BDP. For all of these reasons, we suggest
+the following values for your configuration:
+
+H1 - R link: don’t use a limitation => you WILL get a small added value on the
+RTT, but if the overall RTT is large enough, this is just noise.
+
+R - H2 link: 10 ms, 10 Mbit: this means that the BDP is: RTT 20 ms * 10 Mbit =
+0.02 s * 10 million bit (i.e., 1250000 byte) = 25000. Never forget to configure
+the queue at this link (else it may have a huge value, like 1000 packets), and
+never configure this queue to be more than a BDP (strange things happen to TCP
+when the queue exceeds 2 or 3 BDPs or so). One BDP is a common value, and TCP
+should also work okay with smaller values (at least 2 or 3 packets in size).
+
+The reason for the BDP choice is that adding one BDP of buffering doubles the
+“capacity”, and this queue will exactly drain to 0 (in theory) when a single TCP
+connection halves its cwnd in congestion avoidance (which Reno does; other
+variants are more aggressive). So, this means that any TCP should, in principle,
+be able to send at line rate (or very close to it), when running alone and long
+enough, with a BDP of queuing. One BDP of queuing also should double the
+measured RTT when the queue is full. Test this with a ping!
+
+One BDP of buffering, in our case, means to configure it with 25000 bytes; with
+a common TCP packet size of 1500 bytes, this means 16.666 packets. Since we
+never buffer half a packet, there will really be up to 16 packets queued (and
+the measured RTT will not reach *exactly* twice the base RTT).
+
+The following tc commands MUST be applied at the router node. Note that all the
+queuing disciplines (qdisc) added by tc are egress qdiscs, which mean that they
+will affect only the outgoing packets of the interface where they are applied.
+In our scenario, the bottleneck is the link between the router R and the
+receiver H2, and the queue will be configured at the router’s interface r-h2,
+which faces the receiver.
+
+#+begin_src bash
+  sudo tc qdisc del dev r-h2 root;
+  sudo tc qdisc add dev r-h2 root handle 2: netem delay 20ms;
+  sudo tc qdisc add dev r-h2 parent 2: handle 3: htb default 10;
+  sudo tc class add dev r-h2 parent 3: classid 10 htb rate 10Mbit;
+  sudo tc qdisc add dev r-h2 parent 3:10 handle 11: bfifo limit 25000;
+#+end_src
+
+After applying the commands above, make sure to check that all the qdiscs are added.
+
+#+begin_src bash
+  # sudo tc -s qdisc show dev r-h2
+  qdisc netem 2: root refcnt 9 limit 1000 delay 20ms
+  Sent 140 bytes 2 pkt (dropped 0, overlimits 0 requeues 0)
+  backlog 0b 0p requeues 0
+  qdisc htb 3: parent 2: r2q 10 default 0x10 direct_packets_stat 0
+  direct_qlen 1000
+  Sent 70 bytes 1 pkt (dropped 0, overlimits 0 requeues 0)
+  backlog 0b 0p requeues 0
+  qdisc bfifo 11: parent 3:10 limit 25000b
+  Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)
+  backlog 0b 0p requeues 0
+#+end_src
+
+Check that the 20ms delay is configured properly by pinging the receiver from
+the sender.
+
+#+begin_src bash
+  # ping -c 4 10.2.2.100
+  PING 10.2.2.100 (10.2.2.100) 56(84) bytes of data.
+  64 bytes from 10.2.2.100: icmp_seq=1 ttl=63 time=20.2 ms
+  64 bytes from 10.2.2.100: icmp_seq=2 ttl=63 time=20.2 ms
+  64 bytes from 10.2.2.100: icmp_seq=3 ttl=63 time=20.2 ms
+  64 bytes from 10.2.2.100: icmp_seq=4 ttl=63 time=20.2 ms
+  --- 10.2.2.100 ping statistics ---
+  4 packets transmitted, 4 received, 0% packet loss, time 3004ms
+  rtt min/avg/max/mdev = 20.194/20.224/20.241/0.018 ms
+#+end_src
+
+Finally, check that the bottleneck bandwidth is limited to 10Mbit by running an
+iperf flow from the sender to the receiver. You should see a bandwidth value
+close to 10Mbits/sec.
+
+#+begin_src bash
+  # iperf -c 10.2.2.100
+  ------------------------------------------------------------
+  Client connecting to 10.2.2.100, TCP port 5001
+  TCP window size: 85.3 KByte (default)
+  ------------------------------------------------------------
+  [ 1] local 10.1.1.100 port 53438 connected with 10.2.2.100 port 5001
+  (icwnd/mss/irtt=14/1448/20272)
+  [ ID] Interval Transfer Bandwidth
+  [ 1] 0.0000-10.4520 sec 11.9 MBytes 9.53 Mbits/sec
+#+end_src
+
+* Testing TCP
+
+The easiest way to test TCP is with iperf. Here, different from all other
+client/server situations, a client is a sender and a server is a receiver. Use
+it as follows to also get the cwnd from iperf:
+
+Run iperf3 -s at the receiver host H2 and iperf3 -c 10.2.2.100 at the sender
+host H1.
+
+You need to run this long enough. TCP Reno, in Congestion Avoidance, increases
+its cwnd by 1 every RTT, i.e. every 0.02 seconds, so from half the BDP, it will
+take 16*0.02 = 0.32 seconds to fill the queue once (that’s one saw-tooth). So,
+you’ll get about 3 sawteeth per second, and you may want multiples of seconds to
+get a reasonable average long-term behaviour. The default congestion control in
+Linux is Cubic, which is more aggressive and doesn’t back off as much, so it
+will move a little faster. Here is the output of iperf3 sender:
+
+#+begin_src bash
+  # iperf3 -c 10.2.2.100
+  Connecting to host 10.2.2.100, port 5201
+  [ 7] local 10.1.1.100 port 59910 connected to 10.2.2.100 port 5201
+  [ ID] Interval Transfer Bitrate Retr Cwnd
+  [ 7] 0.00-1.00 sec 1.49 MBytes 12.5 Mbits/sec 38 33.9 KBytes
+  [ 7] 1.00-2.00 sec 1.12 MBytes 9.38 Mbits/sec 3 26.9 KBytes
+  [ 7] 2.00-3.00 sec 1.12 MBytes 9.38 Mbits/sec 2 45.2 KBytes
+  [ 7] 3.00-4.00 sec 1.12 MBytes 9.38 Mbits/sec 4 39.6 KBytes
+  [ 7] 4.00-5.00 sec 1.30 MBytes 10.9 Mbits/sec 4 32.5 KBytes
+  [ 7] 5.00-6.00 sec 1.12 MBytes 9.38 Mbits/sec 4 24.0 KBytes
+  [ 7] 6.00-7.00 sec 1.12 MBytes 9.38 Mbits/sec 2 45.2 KBytes
+  [ 7] 7.00-8.00 sec 1.12 MBytes 9.38 Mbits/sec 4 38.2 KBytes
+  [ 7] 8.00-9.00 sec 1.12 MBytes 9.38 Mbits/sec 4 31.1 KBytes
+  [ 7] 9.00-10.00 sec 1.12 MBytes 9.38 Mbits/sec 4 22.6 KBytes
+  - - - - - - - - - - - - - - - - - - - - - - - - -
+  [ ID] Interval Transfer Bitrate Retr
+  [ 7] 0.00-10.00 sec 11.7 MBytes 9.85 Mbits/sec 69 sender
+  [ 7] 0.00-10.02 sec 11.3 MBytes 9.49 Mbits/sec receiver
+  iperf Done.
+#+end_src
+
+Here is a plot of the cwnd that we got from running iperf with Reno congestion
+control configured (see below for how to do this). The cwnd values are collected
+at the sender host using a ss script and plotted using matplotlib.
+
+#+CAPTION: TCP Reno congestion window
+#+NAME:   fig:tcp-reno-cwnd
+[[./tcp-reno-cwnd.png]]
+
+After the initial slow start peak, we see that congestion avoidance reaches its
+peak at around 32 packets (2 * our BDP of 16 packets, so that seems right), and
+backing off by halving puts it down to a number around 16. And, indeed, we have
+around 3 sawteeth per second! Note that every time TCP backed off, at least one
+packet was lost, and these packet losses should be visible in a wireshark trace.
+As explained earlier, with a BDP of queuing, the measured RTT should
+approximately double, which we can see with a ping test (it reaches close to 40
+ms):
+
+#+begin_src bash
+  # ping 10.2.2.100
+  PING 10.2.2.100 (10.2.2.100) 56(84) bytes of data.
+  64 bytes from 10.2.2.100: icmp_seq=1 ttl=63 time=20.2 ms
+  64 bytes from 10.2.2.100: icmp_seq=2 ttl=63 time=26.8 ms
+  64 bytes from 10.2.2.100: icmp_seq=3 ttl=63 time=37.2 ms
+  64 bytes from 10.2.2.100: icmp_seq=4 ttl=63 time=32.3 ms
+  64 bytes from 10.2.2.100: icmp_seq=5 ttl=63 time=24.9 ms
+  64 bytes from 10.2.2.100: icmp_seq=6 ttl=63 time=38.8 ms
+  64 bytes from 10.2.2.100: icmp_seq=7 ttl=63 time=37.3 ms
+  64 bytes from 10.2.2.100: icmp_seq=8 ttl=63 time=30.8 ms
+  64 bytes from 10.2.2.100: icmp_seq=9 ttl=63 time=25.7 ms
+  64 bytes from 10.2.2.100: icmp_seq=10 ttl=63 time=38.7 ms
+  64 bytes from 10.2.2.100: icmp_seq=11 ttl=63 time=36.3 ms
+  64 bytes from 10.2.2.100: icmp_seq=12 ttl=63 time=20.2 ms
+#+end_src
+
+Why is it not precisely 40ms? For one, the ping packet may not have measured the
+exact point in time when the queue was full (actually, measuring at precisely
+that point would mean that the ping gets dropped). Also, remember, a queue
+length of one BDP would have been 16.666 packets, but 0.666 packets don’t
+exist...
+
+IMPORTANT: everything above was about making informed decisions, knowing what’s
+going on, and not doing “random things”. We know how long we must run a test; we
+know how the queue is configured; we don’t get happy because we see cwnd moving
+in some weird way. We know what value it should reach, we use ping to test if
+the queue really does grow as expected. Everything you do should begin with
+“baby steps” like these – one connection, the simplest possible setup, etc. THEN
+you can take it from there, with more and more baby steps. If cwnd always only
+grows, your setup is wrong. If cwnd is constant, your setup is wrong. If you
+don’t understand what happens, STOP, and go back to this document (or get in
+touch). Please remember this throughout your master thesis. We write this
+paragraph in bold because of various experiences from the past :-)
+
+If you’re using an application other than iperf, you can get the cwnd by polling
+with the “ss” command at the sender host. Here we use dport = 5001, which is the
+listening port of the iperf2 server running at the receiver host H2.
+
+#+begin_src bash
+  sudo ss -i '( dport == 5001 )' dst 10.2.2.100 src 10.1.1.100
+#+end_src
+
+More configuration details, if needed
+
+- Configuring the congestion control and enabling tcp windows scaling
+
+#+begin_src bash
+  sudo sysctl -w net.ipv4.tcp_congestion_control=reno;
+  sudo sysctl -w net.ipv4.tcp_window_scaling=1;
+#+end_src
+
+
+- Disabling hardware offloading (TSO etc.) at the sender’s interface (hardware offloading can
+sometimes do unexpected things to your tests – when in doubt, disable :-) )
+
+
+#+begin_src bash
+  sudo ethtool -K h1-r tso off;
+  sudo ethtool -K h1-r gso off;
+  sudo ethtool -K h1-r lro off;
+  sudo ethtool -K h1-r gro off;
+  sudo ethtool -K h1-r ufo off;
+#+end_src
+
+Useful links
+tc details: [[https://lartc.org][LARTC]]
+[[http://luxik.cdi.cz/~devik/qos/htb/manual/userg.htm][HTB]], which is an element of tc used to implement a rate limit
+[[https://intronetworks.cs.luc.edu/current1/uhtml/mininet.html][One]] out of many similar tutorials on the Internet
